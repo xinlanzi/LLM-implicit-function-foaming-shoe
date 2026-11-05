@@ -1,0 +1,15 @@
+# 原始数据与截图不进版本库（用户可按需单独管理）
+*.xlsx
+.screenshots/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+
+# 日志与临时构建输出
+*.log
+outputs/geometry/build_log.txt
+
+# 大体积 STL 不进 git 历史（生成方式见 outputs/geometry/large_files.md）
+outputs/geometry/*.stl
