@@ -26,12 +26,24 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from config import Config
-from evaluator import EvalMetrics, Evaluator
-from population import Candidate, Population
-from proposer import Proposal, make_proposer, parse_llm_output, scrub_secrets
-from seed_loader import PROFILE_DESCRIPTIONS, PROFILE_TAGS, SeedStructure, _profile_tag_union
-from token_library import TOKEN_BY_NAME, canonical_signature, get_allowed_tokens, token_roles
+try:  # 包导入（python -m optimizer.main）
+    from .config import Config
+    from .evaluator import EvalMetrics, Evaluator
+    from .population import Candidate, Population
+    from .proposer import Proposal, make_proposer, parse_llm_output, scrub_secrets
+    from .seed_loader import (PROFILE_DESCRIPTIONS, PROFILE_TAGS, SeedStructure,
+                              _profile_tag_union)
+    from .token_library import (TOKEN_BY_NAME, canonical_signature, get_allowed_tokens,
+                                token_roles)
+except ImportError:  # 脚本导入（python optimizer/main.py）
+    from config import Config
+    from evaluator import EvalMetrics, Evaluator
+    from population import Candidate, Population
+    from proposer import Proposal, make_proposer, parse_llm_output, scrub_secrets
+    from seed_loader import (PROFILE_DESCRIPTIONS, PROFILE_TAGS, SeedStructure,
+                             _profile_tag_union)
+    from token_library import (TOKEN_BY_NAME, canonical_signature, get_allowed_tokens,
+                               token_roles)
 
 
 def log_round(round_num: int, total: int, cfg: Config, elapsed: float,
@@ -270,14 +282,19 @@ def validate_candidate(obj: dict, cfg: Config, allowed: List[str],
 def select_examples(pop: Population, profile: str, round_num: int, cfg: Config,
                     rng: np.random.Generator) -> Tuple[List[dict], Optional[dict]]:
     """
-    前 10 轮：4 个高分样本 + 1 个随机样本（利用已有知识）；
-    之后：2 个高分样本 + 2 个随机样本（增加探索）。
+    预热期（round_num <= cfg.warmup_rounds）：cfg.n_high_examples 个高分样本 +
+    cfg.n_random_examples 个随机样本；之后换成探索配比
+    cfg.n_high_examples_late / cfg.n_random_examples_late。
 
     高分组优先：先取标签匹配当前目标的种子，再取所有高分候选（含生成候选），
     避免“标签组”为空时无法构造 prompt。
     """
-    n_high = 4 if round_num <= 10 else 2
-    n_random = 1 if round_num <= 10 else 2
+    if round_num <= cfg.warmup_rounds:
+        n_high, n_random = cfg.n_high_examples, cfg.n_random_examples
+    else:
+        n_high, n_random = cfg.n_high_examples_late, cfg.n_random_examples_late
+    n_high = max(1, int(n_high))
+    n_random = max(0, int(n_random))
 
     tag_union = set(_profile_tag_union(profile))
     matched_seeds = [c for c in pop.items if c.source == "seed" and
@@ -440,12 +457,18 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
                 hint = f"{label}（{phase}，已收 {chunks} chunk）"
             elif status == "network_error":
                 hint = "网络/超时"
+            elif status == "duplicate":
+                hint = "与已见组合重复（正常未入池，非故障）"
             else:
                 hint = scrub_secrets(str(exc)).replace("\n", " ")[:80]
+            # 重复候选属于“正常但未入池”的一轮，不按提议器失败统计
+            is_duplicate = (status == "duplicate")
+            reason_text = ("与已见组合重复（未计入提议器失败）" if is_duplicate
+                           else f"提议器失败：{scrub_secrets(str(exc))}")
             entry = {
                 "round": round_num, "label": profile, "status": status,
                 "score": None, "accepted": False,
-                "reason": f"提议器失败：{scrub_secrets(str(exc))}",
+                "reason": reason_text,
                 "terms": [], "coeffs": [],
             }
             if raw_resp:
@@ -467,10 +490,11 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
             history.append(entry)
             all_candidates.append(Candidate(
                 label=profile, terms=[], coeffs=[], score=None, source=arm,
-                round=round_num, accepted=False, reason=f"提议器失败：{scrub_secrets(str(exc))}",
+                round=round_num, accepted=False, reason=reason_text,
                 signature="", status=status,
             ))
-            consecutive_reject += 1
+            if not is_duplicate:
+                consecutive_reject += 1
             if _finish(round_num, False, None, False, usage, elapsed,
                        status=status, hint=hint):
                 break

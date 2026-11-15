@@ -35,14 +35,20 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
-from token_library import (
-    TOKEN_BY_NAME,
-    canonical_signature,
-    get_allowed_tokens,
-)
-
-# 固定真实 HTTP 接口；mock 是本地离线模拟器
-from config import LLM_PROVIDERS
+try:  # 兼容包导入与脚本导入
+    from .token_library import (
+        TOKEN_BY_NAME,
+        canonical_signature,
+        get_allowed_tokens,
+    )
+    from .config import LLM_PROVIDERS
+except ImportError:
+    from token_library import (
+        TOKEN_BY_NAME,
+        canonical_signature,
+        get_allowed_tokens,
+    )
+    from config import LLM_PROVIDERS
 
 LLM_PROVIDER_NAMES = frozenset(k for k in LLM_PROVIDERS if k != "mock")
 
@@ -255,17 +261,18 @@ class MockLLMProposer(BaseProposer):
             else:
                 terms, coeffs, prov = self._explore()
             terms, coeffs = _trim_terms(terms, coeffs, self.cfg.max_terms)
-            coeffs = [_non_tiny(_clamp_coeff(c, self.cfg.coeff_min, self.cfg.coeff_max), self.rng) for c in coeffs]
             if not terms or len(terms) > self.cfg.max_terms:
                 continue
             if len(set(terms)) != len(terms):
-                # 去重同一 token（合并系数）
+                # 先合并同名项，再统一 clamp；否则合并后系数可能超出上限被整轮丢弃
                 merged: Dict[str, float] = {}
                 for t, c in zip(terms, coeffs):
                     merged[t] = merged.get(t, 0.0) + c
                 terms, coeffs = list(merged.keys()), list(merged.values())
                 if len(terms) > self.cfg.max_terms:
                     continue
+            coeffs = [_non_tiny(_clamp_coeff(c, self.cfg.coeff_min, self.cfg.coeff_max), self.rng)
+                      for c in coeffs]
             sig = canonical_signature(terms, coeffs)
             if not sig or sig in seen_signatures:
                 continue
@@ -460,6 +467,21 @@ class CredentialError(RuntimeError):
 
 # 弹窗输入的 key 只问一次，只存在内存，不落盘。
 _KEY_CACHE: Dict[str, str] = {"value": ""}
+# --api-key-stdin：无桌面环境（SSH/CI）时的显式备选；不读环境变量、不进 shell 历史
+_STDIN_KEY_ENABLED: Dict[str, bool] = {"value": False}
+
+
+def enable_stdin_key() -> None:
+    """显式开启“从标准输入读取一次密钥”（仅由 --api-key-stdin 调用）。"""
+    _STDIN_KEY_ENABLED["value"] = True
+
+
+def _read_key_from_stdin() -> str:
+    import sys
+    key = (sys.stdin.readline() or "").strip()
+    if not key:
+        raise CredentialError("--api-key-stdin 未从标准输入读到密钥，已中止。")
+    return key
 
 
 def mask_secret(value: str) -> str:
@@ -548,10 +570,15 @@ def _ask_key(label: str = "SiliconFlow API 密钥") -> str:
 
 
 def resolve_api_key(cfg) -> Tuple[str, str]:
-    """从安全弹窗获取密钥并缓存于进程内存，返回 (key, 来源说明)。"""
+    """从安全弹窗（或显式 stdin）获取密钥并缓存于进程内存，返回 (key, 来源说明)。"""
     cached = _KEY_CACHE.get("value", "")
     if cached:
-        return cached, "内存缓存（本进程此前已通过弹窗输入）"
+        return cached, "内存缓存（本进程此前已输入）"
+
+    if _STDIN_KEY_ENABLED["value"]:
+        key = _read_key_from_stdin()
+        _KEY_CACHE["value"] = key
+        return key, "--api-key-stdin 标准输入（仅进程内缓存）"
 
     key = _ask_key()
     _KEY_CACHE["value"] = key
@@ -1091,7 +1118,9 @@ class OpenAICompatibleProposer(BaseProposer):
             usage_total["requests"] += max(1, int(usage.get("requests") or 1))
             sources.add(usage.get("usage_source", "estimated"))
 
+        attempts_made = 0
         for attempt in range(retries):
+            attempts_made = attempt + 1
             meta: dict = {}
             try:
                 text, usage, meta = self._call(prompt)
@@ -1121,6 +1150,8 @@ class OpenAICompatibleProposer(BaseProposer):
                     dup = ValueError("候选与已见签名重复")
                     dup.status = "duplicate"
                     last_err = dup
+                    # 同一 prompt 重发很可能再次给出重复候选，直接结束重试以省 token
+                    break
                 except ValueError as exc:
                     # finish_reason=length 时解析失败，直接标为"被 max_tokens 截断"
                     exc.status = ("truncated" if meta.get("finish_reason") == "length"
@@ -1136,7 +1167,7 @@ class OpenAICompatibleProposer(BaseProposer):
         status = getattr(last_err, "status", None) or (
             "http_error" if isinstance(last_err, LLMRetryableError) else "proposer_failed")
         err = RuntimeError(
-            f"LLM 调用或解析失败（status={status}，已尝试 {retries} 次）："
+            f"LLM 调用或解析失败（status={status}，已尝试 {attempts_made} 次）："
             f"{scrub_secrets(str(last_err))}")
         err.status = status
         err.raw = getattr(last_err, "raw", "") or ""
@@ -1152,10 +1183,14 @@ class OpenAICompatibleProposer(BaseProposer):
 
 def check_llm_endpoint(cfg) -> Tuple[str, str]:
     """
-    轻量自检：弹窗读取密钥后发一次最小请求，验证凭证 / 固定端点 / 固定模型名。
+    自检：复用正式请求路径（chat_once）验证凭证 / 端点 / 模型 / content 可用性。
+
+    与正式运行使用同一个 max_tokens，避免推理模型思维链占满额度时出现
+    “自检通过、正式运行 content 全空”的假阳性。
 
     返回 (状态码, 人类可读说明)，状态码用于进程退出码：
-        ok / no_key / auth / not_found / quota / timeout / network / server / bad_response
+        ok / no_key / empty_content / auth / not_found / quota /
+        timeout / network / server / bad_response
     说明文本中只出现打码后的 key，绝不打印完整凭证。
     """
     base = (f"provider: {cfg.proposer_backend}\n"
@@ -1168,64 +1203,55 @@ def check_llm_endpoint(cfg) -> Tuple[str, str]:
         return "no_key", base + f"凭证   : (未获取)\n✗ {exc}"
 
     head = base + (f"凭证   : {mask_secret(key)}（来源：{source}）\n"
-                   f"超时   : {cfg.llm_timeout}s\n")
+                   f"max_tokens: {cfg.llm_max_tokens} | 超时: {cfg.llm_timeout}s\n")
 
-    payload = {
-        "model": cfg.llm_model,
-        "temperature": 0,
-        "max_tokens": 16,      # 只要一个极短响应；部分服务不接受 1
-        "stream": False,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    # 默认不发送 enable_thinking：部分模型不接受该字段，会让自检误报 400
-    if cfg.proposer_backend == "siliconflow" and bool(cfg.llm_enable_thinking):
-        payload["enable_thinking"] = True
-    req = urllib.request.Request(
-        cfg.llm_base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=min(cfg.llm_timeout, 30.0)) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            data = json.loads(raw)
-            ok = bool(data.get("choices"))
-        except Exception:
-            ok = False
-        if ok:
-            return "ok", head + "✓ 连通成功：凭证、端点、模型名均可用。"
-        return "bad_response", head + f"✗ 端点返回了非预期内容：{raw[:300]}"
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace")[:400]
-        except Exception:
-            pass
-        # SiliconFlow 的错误体：401 为纯字符串 "Invalid token"，429/503 为 JSON 对象
-        body = scrub_secrets(body)
-        if exc.code in (401, 403):
-            return "auth", head + (f"✗ HTTP {exc.code} 认证失败：密钥无效、已过期或无权限。\n"
+    out = chat_once(cfg, "只回复 OK 两个字符。", stream=bool(cfg.llm_stream),
+                    max_tokens=int(cfg.llm_max_tokens))
+    usage = out.get("usage") or {}
+    usage_line = (f"usage  : {int(usage.get('total_tokens') or 0):,} token"
+                  f"（{usage.get('usage_source', 'none')}）\n")
+    content = (out.get("content") or "").strip()
+    reasoning = (out.get("reasoning") or "").strip()
+    kind = out.get("error_kind")
+
+    if not kind and content:
+        return "ok", head + usage_line + "✓ 连通成功：凭证、端点、模型均可用，content 非空。"
+
+    if not kind and not content:
+        extra = "；已有思维链输出，说明额度被推理过程占满" if reasoning else ""
+        return "empty_content", head + usage_line + (
+            f"✗ HTTP 200 但 content 为空{extra}（finish_reason="
+            f"{out.get('finish_reason')}）。\n"
+            f"  处理：提高 --max-tokens（当前 {cfg.llm_max_tokens}），或改用非推理模型。")
+
+    http_status = out.get("http_status")
+    body = scrub_secrets(str(out.get("body") or out.get("error") or ""))[:400]
+
+    if kind == "http_error":
+        if http_status in (401, 403):
+            return "auth", head + (f"✗ HTTP {http_status} 认证失败：密钥无效、已过期或无权限。\n"
                                    f"  处理：到平台重新生成密钥，确认没有多余空格/引号。\n  {body}")
-        if exc.code == 404:
+        if http_status == 404:
             return "not_found", head + (f"✗ HTTP 404：端点路径或模型名不存在。\n"
-                                        f"  处理：检查 base_url 是否以 /v1 结尾、模型名拼写是否正确"
+                                        f"  处理：确认模型名拼写"
                                         f"（SiliconFlow 形如 deepseek-ai/DeepSeek-V4-Flash）。\n  {body}")
-        if exc.code == 429:
+        if http_status == 429:
             return "quota", head + f"✗ HTTP 429 配额/频率限制：请充值或降低调用频率。\n  {body}"
-        if 500 <= exc.code < 600:
-            return "server", head + f"✗ HTTP {exc.code} 服务端错误：稍后重试或联系服务商。\n  {body}"
-        return "server", head + f"✗ HTTP {exc.code}：{body}"
-    except (TimeoutError, OSError) as exc:
-        # urllib 的超时在部分平台表现为 socket.timeout（OSError 子类）
-        name = type(exc).__name__
-        if "timeout" in name.lower() or "timed out" in str(exc).lower():
-            return "timeout", head + f"✗ 请求超时（{name}）：网络不通或服务端无响应。"
-        return "network", head + (f"✗ 网络不可达（{name}: {exc}）。\n"
-                                  f"  处理：检查代理/防火墙，或确认 base_url 主机名可达。")
-    except Exception as exc:  # 兜底，避免自检本身崩溃
-        return "server", head + f"✗ 未预期错误（{type(exc).__name__}）：{exc}"
+        if isinstance(http_status, int) and 500 <= http_status < 600:
+            return "server", head + f"✗ HTTP {http_status} 服务端错误：稍后重试或联系服务商。\n  {body}"
+        return "server", head + f"✗ HTTP {http_status}：{body}"
+
+    if kind == "timeout":
+        phase = out.get("timeout_phase") or "-"
+        label = {"connect": "连接超时", "first_byte": "首字节超时",
+                 "idle": "块间空闲超时", "total": "总时长超时"}.get(phase, "超时")
+        return "timeout", head + f"✗ {label}（{phase}）：网络不通或服务端无响应。"
+
+    if kind == "network_error":
+        return "network", head + f"✗ 网络不可达：{out.get('error') or '连接失败'}。\n" \
+                                 f"  处理：检查代理/防火墙，或确认主机名可达。"
+
+    return "bad_response", head + f"✗ 未预期的响应：{body or kind}"
 
 
 def make_proposer(config, arm: str, seed_offset: int = 0):

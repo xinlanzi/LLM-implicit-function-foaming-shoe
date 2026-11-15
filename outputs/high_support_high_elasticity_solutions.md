@@ -34,7 +34,7 @@
 | 评价网格 | 64³，等值面 `F=0`，实体相 `F<=0`（skeletal 约定） |
 | token 词表 | 41 个三角闭式 token（文档 12 个核心 token + Excel 中真实出现的 sin·sin、三乘积、倍频项） |
 | 种子 | 37 个结构中有 9 个可由三角闭式表达并去重后进入搜索；其余 28 个为 FRep/图论/坐标参数化结构，不参与隐函数搜索 |
-| 提议器 | 默认 `mock`（本地上下文感知模拟器，不调用评价器）；可切换真实 OpenAI-compatible LLM API |
+| 提议器 | 默认 `mock`（本地上下文感知模拟器，不调用评价器）；真实模式固定 SiliconFlow 接口与 `deepseek-ai/DeepSeek-V4-Flash`，密钥仅运行时弹窗输入 |
 
 复现命令：
 
@@ -48,14 +48,20 @@ D:\anaconda\python.exe optimizer\main.py
 D:\anaconda\python.exe optimizer\main.py --token-set core
 ```
 
-接入真实 LLM：
+接入真实 LLM（接口与模型已固定在 `optimizer/config.py`，无需设置任何环境变量）：
 
 ```powershell
-$env:LLM_API_KEY="你的 key"
-$env:LLM_BASE_URL="https://api.openai.com/v1"   # 或豆包/ollama 的 OpenAI-compatible 地址
-$env:LLM_MODEL="gpt-4o-mini"
-D:\anaconda\python.exe optimizer\main.py --llm-backend openai
+# 运行后会弹出掩码输入框，密钥只保存在进程内存
+D:\anaconda\python.exe optimizer\main.py --llm-backend siliconflow --rounds 3 --stop-after-first-response
+
+# 冒烟前可先自检端点/凭证/模型（同样弹窗输入密钥）
+D:\anaconda\python.exe optimizer\main.py --check-llm
+
+# 无桌面环境（SSH/CI）时，可显式改为从标准输入读取一次密钥
+D:\anaconda\python.exe optimizer\main.py --llm-backend siliconflow --api-key-stdin
 ```
+
+> 依赖安装：`D:\anaconda\python.exe -m pip install -r requirements.txt`
 
 ---
 

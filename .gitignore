@@ -1,5 +1,7 @@
 # 原始数据与截图不进版本库（用户可按需单独管理）
 *.xlsx
+# 例外：优化器默认数据副本必须入库，保证新克隆可直接运行
+!data/*.xlsx
 .screenshots/
 
 # Python 缓存
@@ -17,3 +19,11 @@ outputs/geometry/build_log.txt
 
 # 大体积 STL 不进 git 历史（生成方式见 outputs/geometry/large_files.md）
 outputs/geometry/*.stl
+
+# 运行产物与大压缩包不进版本库（结论文档与几何清单保留）
+# 每次运行都会重新生成的 CSV / JSON / PNG 只作为本地结果，不提交
+outputs/*.csv
+outputs/*.json
+outputs/*.png
+outputs/*.zip
+outputs/geometry/*.zip

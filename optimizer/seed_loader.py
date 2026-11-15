@@ -20,7 +20,10 @@ from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 
-from token_library import expr_to_name, canonical_signature
+try:  # 兼容包导入与脚本导入
+    from .token_library import expr_to_name, canonical_signature
+except ImportError:
+    from token_library import expr_to_name, canonical_signature
 
 
 # --------------------------------------------------------------------------- #

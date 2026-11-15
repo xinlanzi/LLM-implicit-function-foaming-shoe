@@ -4,9 +4,13 @@
 
 运行示例
 --------
-    D:\\anaconda\\python.exe optimizer\\main.py
-    D:\\anaconda\\python.exe optimizer\\main.py --rounds 50 --profile high_support_high_elasticity
-    D:\\anaconda\\python.exe optimizer\\main.py --llm-backend mock   # 离线自检，不访问 LLM
+    python optimizer/main.py
+    python -m optimizer.main                 # 两种入口等价
+    python optimizer/main.py --rounds 50 --profile high_support_high_elasticity
+    python optimizer/main.py --llm-backend mock   # 离线自检，不访问 LLM
+
+真实 LLM 的接口与模型固定在 config.py；运行后弹窗输入一次密钥（仅进程内存）。
+无桌面环境时可加 --api-key-stdin 从标准输入读取。
 
 可选：--extra-profiles high_support,high_elasticity 会额外各跑 50 轮 LLM-only，
 用于展示“同一套优化器支持不同目标性能输入”。
@@ -25,26 +29,34 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
-# 允许直接 python optimizer/main.py 运行
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# 同时支持脚本入口与包入口：
+#   python optimizer/main.py
+#   python -m optimizer.main
+# 脚本模式下 sys.path[0] 是 optimizer/，会让 `import optimizer` 命中 optimizer.py
+# 而不是包，因此先把项目根目录提到最前，并移除脚本目录。
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+while _SCRIPT_DIR in sys.path:
+    sys.path.remove(_SCRIPT_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-from config import Config, LLM_PROVIDERS
-from evaluator import Evaluator
-from optimizer import UsageMeter, build_prompt, compare_arms, run_arm
-from proposer import (
+from optimizer.config import Config, LLM_PROVIDERS
+from optimizer.evaluator import Evaluator
+from optimizer.optimizer import UsageMeter, build_prompt, compare_arms, run_arm
+from optimizer.proposer import (
     CredentialError,
     build_chat_payload,
     chat_once,
     check_llm_endpoint,
+    enable_stdin_key,
     estimate_tokens,
     mask_secret,
     parse_llm_output,
     resolve_api_key,
 )
-from seed_loader import PROFILE_DESCRIPTIONS, describe_seed_table, load_seeds
-from token_library import get_allowed_tokens
+from optimizer.seed_loader import PROFILE_DESCRIPTIONS, describe_seed_table, load_seeds
+from optimizer.token_library import get_allowed_tokens
 
 
 def _json_default(obj):
@@ -74,7 +86,10 @@ def plot_comparison(llm_res: dict, random_res: dict, out_path: str, cfg: Config)
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    plt.rcParams["font.sans-serif"] = [
+        "PingFang SC", "Heiti SC", "Microsoft YaHei", "SimHei",
+        "Noto Sans CJK SC", "WenQuanYi Zen Hei", "DejaVu Sans",
+    ]
     plt.rcParams["axes.unicode_minus"] = False
 
     profile = llm_res["profile"]
@@ -405,7 +420,11 @@ def main():
     parser.add_argument("--stop-after-first-response", action="store_true",
                         help="冒烟用：第一次成功解析出候选后停机（本轮评价/入池/记录照常完成）")
     parser.add_argument("--seed", type=int, default=None, help="随机种子")
+    parser.add_argument("--excel", type=str, default=None,
+                        help="种子 Excel 路径（默认 data/Structure_Master_V1.0.xlsx）")
     parser.add_argument("--outdir", type=str, default=None)
+    parser.add_argument("--api-key-stdin", action="store_true",
+                        help="无桌面环境时从标准输入读取一次密钥（不进 shell 历史；默认仍用弹窗）")
     parser.add_argument("--extra-profiles", type=str, default="high_support,high_elasticity",
                         help="额外跑 LLM-only 的目标，逗号分隔；设为空字符串关闭")
     args = parser.parse_args()
@@ -428,18 +447,25 @@ def main():
     # 真实 LLM 的端点与模型固定；密钥仅由运行时安全弹窗读取。
     if args.seed is not None:
         cfg.seed = args.seed
+    if args.excel is not None:
+        cfg.excel_path = args.excel
     if args.outdir is not None:
         cfg.output_dir = args.outdir
+    if args.api_key_stdin:
+        enable_stdin_key()
 
     # 自检模式：只发一次极短请求验证凭证/端点/模型，不进入优化流程
     if args.check_llm:
         status, detail = check_llm_endpoint(cfg)
         print("LLM 连通性自检")
         print("-" * 60)
-        print("密钥输入  : 安全弹窗（仅进程内存，不落盘）")
+        print("密钥输入  : "
+              + ("--api-key-stdin 标准输入（仅进程内存，不落盘）" if args.api_key_stdin
+                 else "安全弹窗（仅进程内存，不落盘）"))
         print(detail)
         code = {"ok": 0, "no_key": 2, "auth": 3, "not_found": 4,
-                "timeout": 5, "network": 5, "quota": 6}.get(status, 7)
+                "timeout": 5, "network": 5, "quota": 6,
+                "empty_content": 8}.get(status, 7)
         sys.exit(code)
 
     # 单次调试模式：用真实 prompt 打一次，不跑优化、不写盘
@@ -460,7 +486,11 @@ def main():
             _note = f"prompt 已截断到 {int(n_chars)} 字符（短 prompt 探活，结果不能当正式结论）"
         sys.exit(_debug_one_call(cfg, _prompt, prompt_note=_note))
 
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    if not os.path.isfile(cfg.excel_path):
+        print(f"✗ 找不到种子 Excel：{cfg.excel_path}")
+        print("  处理：把数据放到 data/Structure_Master_V1.0.xlsx，或用 --excel 指定路径。")
+        sys.exit(2)
+
     profile = cfg.profile()
 
     print("=" * 78)
@@ -480,7 +510,9 @@ def main():
         print(f"超时         : 建连 {cfg.llm_connect_timeout:.0f}s / 首字节 "
               f"{cfg.llm_first_token_timeout:.0f}s / 块间 {cfg.llm_idle_timeout:.0f}s / "
               f"总上限 {cfg.llm_timeout:.0f}s")
-        print("密钥输入     : 安全弹窗输入一次，仅进程内缓存，不落盘")
+        print("密钥输入     : " + ("--api-key-stdin 标准输入一次" if args.api_key_stdin
+                                    else "安全弹窗输入一次")
+              + "，仅进程内缓存，不落盘")
         print(f"token 预算   : "
               f"{('不限' if cfg.max_total_tokens is None else f'{cfg.max_total_tokens:,}')}"
               f" | 冒烟停止: {'开' if cfg.stop_after_first_response else '关'}")
@@ -490,6 +522,7 @@ def main():
 
     # ---- 1. 读取种子 ----
     seeds, excluded, performance = load_seeds(cfg.excel_path)
+    os.makedirs(cfg.output_dir, exist_ok=True)
     print(f"\n可优化三角闭式种子: {len(seeds)} 个；未纳入隐函数搜索: {len(excluded)} 个")
     for s in seeds:
         print(f"  {s.sid} {s.name:24s} terms={s.terms} coeffs={[round(c,3) for c in s.coeffs]}")
@@ -504,20 +537,29 @@ def main():
                                _examples[-1] if _examples else None, 1, cfg)
         per_prompt = estimate_tokens(_prompt)
         per_round = per_prompt + int(cfg.llm_max_tokens)
-        worst = cfg.rounds * per_round
+        # 额外目标 profile 同样消耗 token，成本预估必须计入，否则会低估数倍
+        _extra = [p.strip() for p in str(args.extra_profiles or "").split(",") if p.strip()]
+        _extra = [p for p in _extra if p in PROFILE_DESCRIPTIONS and p != profile]
+        n_profiles = 1 + len(_extra)
+        worst = n_profiles * cfg.rounds * per_round
         print("\n" + "-" * 78)
         print("token 成本预估（粗估；实际以服务端 usage 为准）")
         print("-" * 78)
+        print(f"  运行目标 ≈ {n_profiles} 个"
+              + (f"（{profile} + {', '.join(_extra)}）" if _extra else f"（{profile}）"))
         print(f"  prompt ≈ {per_prompt:,} token（按实际 build_prompt 首条统计；"
               f"ASCII 4 字符/token、中文 1.6 字符/token）")
         print(f"  每轮 1 次请求 × (prompt {per_prompt:,} + max_tokens {cfg.llm_max_tokens}) "
               f"≈ {per_round:,} token")
         if cfg.stop_after_first_response:
-            print(f"  本次开启 --stop-after-first-response：预计 1 轮 ≈ {per_round:,} token")
+            print(f"  本次开启 --stop-after-first-response：预计 1 轮 ≈ {per_round:,} token"
+                  f"（触发后不再跑后续目标）")
         else:
-            print(f"  最坏 {cfg.rounds} 轮 ≈ {worst:,} token（不含重试；重试会额外消耗）")
+            print(f"  最坏 {n_profiles} 个目标 × {cfg.rounds} 轮 ≈ {worst:,} token"
+                  f"（不含重试；重试会额外消耗）")
         if cfg.max_total_tokens is not None and per_round > 0:
-            trigger_at = min(cfg.rounds, max(1, -(-int(cfg.max_total_tokens) // per_round)))
+            per_all = per_round * n_profiles
+            trigger_at = min(cfg.rounds, max(1, -(-int(cfg.max_total_tokens) // per_all)))
             print(f"  预算 --max-total-tokens={cfg.max_total_tokens:,} → "
                   f"预计第 {trigger_at} 轮后触发停机")
         try:

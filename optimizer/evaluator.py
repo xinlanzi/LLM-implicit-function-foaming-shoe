@@ -35,7 +35,10 @@ import numpy as np
 from scipy import ndimage
 from skimage import measure
 
-from token_library import build_function
+try:  # 包导入（python -m optimizer.main）
+    from .token_library import build_function
+except ImportError:  # 脚本导入（python optimizer/main.py、geometry 子脚本）
+    from token_library import build_function
 
 
 @dataclass

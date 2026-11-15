@@ -11,7 +11,11 @@
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+# 项目根目录（optimizer/ 的上一级），所有默认路径都相对于它，换机器无需改代码
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _env_str(name: str, default: str) -> str:
@@ -49,9 +53,10 @@ LLM_PROVIDERS = {
 @dataclass
 class Config:
     # ------------------------------------------------------------------ 数据与路径
-    # 原始 Excel 只读，不做任何修改
-    excel_path: str = r"c:\Users\hp\Desktop\LLM\晶格结构统一知识库_Structure_Master_V1.0.xlsx"
-    output_dir: str = r"c:\Users\hp\Desktop\LLM\outputs"
+    # 原始 Excel 只读，不做任何修改；版本库内副本位于 data/，可用 --excel 覆盖
+    excel_path: str = field(
+        default_factory=lambda: str(PROJECT_ROOT / "data" / "Structure_Master_V1.0.xlsx"))
+    output_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "outputs"))
 
     # token 词表模式：
     #   "core"    —— 严格使用技术文档给出的 12 个基函数
@@ -64,8 +69,11 @@ class Config:
     seed: int = 20260101
     rounds: int = 50                 # 技术文档要求的轮数（LLM / 随机基线各 50 轮）
     pool_size: int = 10              # 每个目标池最多保留 10 个候选
-    n_high_examples: int = 3         # prompt 中放入的高分样本数（文档建议 2~4）
-    n_random_examples: int = 1       # prompt 中放入的随机多样性样本数
+    n_high_examples: int = 4         # 预热期 prompt 中放入的高分样本数（文档建议 2~4）
+    n_random_examples: int = 1       # 预热期 prompt 中放入的随机多样性样本数
+    warmup_rounds: int = 10          # 预热期轮数：此前后样本配比不同
+    n_high_examples_late: int = 2    # 预热期之后的高分样本数（增加探索）
+    n_random_examples_late: int = 2  # 预热期之后的随机样本数
     max_terms: int = 3               # 生成候选最多 3 个基函数
     coeff_min: float = -2.0          # 生成候选系数下界
     coeff_max: float = 2.0           # 生成候选系数上界

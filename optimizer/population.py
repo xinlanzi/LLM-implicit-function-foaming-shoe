@@ -19,7 +19,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from token_library import canonical_signature
+try:  # 兼容包导入与脚本导入
+    from .token_library import canonical_signature
+except ImportError:
+    from token_library import canonical_signature
 
 
 @dataclass
