@@ -397,6 +397,8 @@ def main():
     parser = argparse.ArgumentParser(description="LLM 驱动的 TPMS 隐函数组合优化器")
     parser.add_argument("--rounds", type=int, default=None, help="每臂轮数（默认 50）")
     parser.add_argument("--profile", type=str, default=None, help="目标性能 profile")
+    parser.add_argument("--metric-rule", type=str, default=None, choices=["v1", "v2"],
+                        help="评分规则：v1（默认，历史规则不变）/ v2（独立新规则）")
     parser.add_argument("--token-set", type=str, default=None, choices=["core", "library"])
     parser.add_argument("--llm-backend", "--llm-provider", dest="llm_backend", type=str,
                         default=None, choices=list(LLM_PROVIDERS),
@@ -434,6 +436,8 @@ def main():
         cfg.rounds = args.rounds
     if args.profile is not None:
         cfg.default_profile = args.profile
+    if args.metric_rule is not None:
+        cfg.metric_rule = args.metric_rule
     if args.token_set is not None:
         cfg.token_set = args.token_set
     if args.llm_backend is not None:
@@ -518,6 +522,9 @@ def main():
               f" | 冒烟停止: {'开' if cfg.stop_after_first_response else '关'}")
     print(f"随机种子     : {cfg.seed}")
     print(f"评价网格     : {cfg.grid_n}^3，等值面 F=0，实体相 F<=0")
+    print(f"评分规则     : {cfg.metric_rule}"
+          + ("（v1：密度+连通+平滑+各向同性加权）" if cfg.metric_rule == "v1"
+             else "（v2：sheet 多密度扫描 + 各向同性乘法门）"))
     print(f"输出目录     : {cfg.output_dir}")
 
     # ---- 1. 读取种子 ----

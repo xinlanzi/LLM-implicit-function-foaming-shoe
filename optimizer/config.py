@@ -83,6 +83,14 @@ class Config:
     # ------------------------------------------------------------------ 评价器
     grid_n: int = 64                 # 单胞采样网格 64^3
     iso_level: float = 0.0           # 隐式曲面 F(x,y,z)=0
+    # 评分规则："v1" 为原有规则（默认，历史分数不变）；"v2" 为独立的新规则，
+    # 仅由 --metric-rule v2 启用，实现见 optimizer/metrics_v2.py。
+    metric_rule: str = "v1"
+    # v2 专用：各向同性乘法门的门槛与幂次
+    iso_gate_floor: float = 0.75
+    iso_gate_power: float = 2.0
+    # v2 专用：sheet 型实体化的目标相对密度扫描点
+    rho_targets: tuple = (0.15, 0.25, 0.35)
     domain_min: float = 0.0          # 单胞定义域 [0, 2π]
     domain_max: float = 6.283185307179586
     band_voxels: float = 1.5         # 曲率统计使用的等值面带宽（以网格步长为单位）
@@ -112,6 +120,13 @@ class Config:
     })
     area_target: float = 0.50         # 比表面积（面积/单胞体积）偏好中心
     area_sigma: float = 0.22          # 比表面积窗口宽度
+    # v2 子分数权重（不含密度与 isotropy：密度由 sheet 扫描控制，isotropy 改为乘法门）
+    support_v2_subweights: dict = field(default_factory=lambda: {
+        "connectivity": 0.35, "smoothness": 0.40, "area_window": 0.25,
+    })
+    elastic_v2_subweights: dict = field(default_factory=lambda: {
+        "connectivity": 0.30, "smoothness": 0.25, "uniformity": 0.25, "area_window": 0.20,
+    })
     # 曲率平滑度 exp(-k * H)，k 越大越惩罚高曲率
     curvature_k: float = 2.0
 
