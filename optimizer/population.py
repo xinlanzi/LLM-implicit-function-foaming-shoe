@@ -76,6 +76,10 @@ class Candidate:
             "area_per_volume": round(float(m.get("area_per_volume", 0.0)), 6) if m else None,
             "smoothness": round(float(m.get("smoothness", 0.0)), 6) if m else None,
             "uniformity": round(float(m.get("uniformity", 0.0)), 6) if m else None,
+            # v2 规则诊断字段（v1 下为 0 / 空）
+            "isotropy_entropy": round(float(m.get("isotropy_entropy", 0.0)), 6) if m else None,
+            "isotropy_gate": round(float(m.get("isotropy_gate", 0.0)), 6) if m else None,
+            "rho_scan": m.get("rho_scan", ""),
             "provenance": json.dumps(self.provenance, ensure_ascii=False),
             "tags": self.tags,
             "signature": self.signature,

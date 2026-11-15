@@ -37,8 +37,10 @@ from skimage import measure
 
 try:  # 包导入（python -m optimizer.main）
     from .token_library import build_function
+    from . import metrics_v2
 except ImportError:  # 脚本导入（python optimizer/main.py、geometry 子脚本）
     from token_library import build_function
+    import metrics_v2
 
 
 @dataclass
@@ -68,6 +70,10 @@ class EvalMetrics:
     elastic_proxy: float = 0.0
     score: float = 0.0
     score_detail: str = ""
+    # v2 规则专用（v1 保持默认 0 / 空，不影响原有字段与分数）
+    isotropy_entropy: float = 0.0
+    isotropy_gate: float = 0.0
+    rho_scan: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -293,7 +299,19 @@ class Evaluator:
         else:
             isotropy = 0.0
 
-        return dict(
+        extra = {}
+        if str(getattr(self.cfg, "metric_rule", "v1")).lower() == "v2":
+            # R-13：连续方向熵 + R-12 的乘法门
+            entropy, gate = metrics_v2.isotropy_entropy(
+                nx, ny, nz, band,
+                float(self.cfg.iso_gate_floor), float(self.cfg.iso_gate_power))
+            extra["isotropy_entropy"] = entropy
+            extra["isotropy_gate"] = gate
+            # R-14：sheet 型实体化 + 多密度扫描，覆盖 skeletal 的相位统计
+            extra.update(metrics_v2.sheet_phase_stats(
+                F, gmag, self.cfg.rho_targets, _component_stats))
+
+        result = dict(
             valid=True, reason="ok",
             rho_solid=rho_solid, rho_void=rho_void,
             solid_components=int(solid_components), void_components=int(void_components),
@@ -307,6 +325,8 @@ class Evaluator:
             n_surface_voxels=int(band.sum()),
             f_min=f_min, f_max=f_max, f_std=f_std,
         )
+        result.update(extra)
+        return result
 
     # ------------------------------------------------------------------ 打分
     def _apply_score(self, base: dict, profile: str) -> EvalMetrics:
@@ -314,6 +334,13 @@ class Evaluator:
         if not base.get("valid", False):
             return EvalMetrics(**{**base, "support_proxy": 0.0, "elastic_proxy": 0.0,
                                   "score": 0.0, "score_detail": "invalid"})
+
+        if str(getattr(cfg, "metric_rule", "v1")).lower() == "v2":
+            support, elastic, score_value, detail = metrics_v2.score(base, profile, cfg)
+            payload = {k: v for k, v in base.items()
+                       if k not in ("support_proxy", "elastic_proxy", "score", "score_detail")}
+            return EvalMetrics(**payload, support_proxy=support, elastic_proxy=elastic,
+                               score=score_value, score_detail=detail)
 
         rho = base["rho_solid"]
         # 支撑：密度越高越能承载，但用 density_ref 归一化，避免无上限地奖励“越密越好”
