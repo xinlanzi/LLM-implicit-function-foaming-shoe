@@ -34,21 +34,22 @@
 | 评价网格 | 64³，等值面 `F=0`，实体相 `F<=0`（skeletal 约定） |
 | token 词表 | 41 个三角闭式 token（文档 12 个核心 token + Excel 中真实出现的 sin·sin、三乘积、倍频项） |
 | 种子 | 37 个结构中有 9 个可由三角闭式表达并去重后进入搜索；其余 28 个为 FRep/图论/坐标参数化结构，不参与隐函数搜索 |
-| 提议器 | 默认 `mock`（本地上下文感知模拟器，不调用评价器）；真实模式固定 SiliconFlow 接口与 `deepseek-ai/DeepSeek-V4-Flash`，密钥仅运行时弹窗输入 |
+| 提议器 | 默认 `siliconflow`（接口与 `deepseek-ai/DeepSeek-V4-Flash` 已固定在 `optimizer/config.py`，运行时弹窗输入密钥）；**本文表格数字为离线口径，复现时必须显式加 `--llm-backend mock`** |
 
-复现命令：
-
-```powershell
-D:\anaconda\python.exe optimizer\main.py
-```
-
-严格使用技术文档 12 个核心 token 的对照组：
+### 离线复现（本文所有表格数字的口径，不联网）
 
 ```powershell
-D:\anaconda\python.exe optimizer\main.py --token-set core
+# 默认已是 siliconflow，离线复现必须显式指定 mock
+D:\anaconda\python.exe optimizer\main.py --llm-backend mock
 ```
 
-接入真实 LLM（接口与模型已固定在 `optimizer/config.py`，无需设置任何环境变量）：
+严格使用技术文档 12 个核心 token 的对照组（同样离线）：
+
+```powershell
+D:\anaconda\python.exe optimizer\main.py --llm-backend mock --token-set core
+```
+
+### 真实 LLM 调用（会联网并消耗 token，结果不可与上表直接比较）
 
 ```powershell
 # 运行后会弹出掩码输入框，密钥只保存在进程内存
@@ -60,6 +61,9 @@ D:\anaconda\python.exe optimizer\main.py --check-llm
 # 无桌面环境（SSH/CI）时，可显式改为从标准输入读取一次密钥
 D:\anaconda\python.exe optimizer\main.py --llm-backend siliconflow --api-key-stdin
 ```
+
+> **验证状态限定**：真实 LLM 调用路径已实现，但**尚未用真实密钥实测**；演示或答辩时不要表述为“已验证可用”。
+> 验收标准是 `run_log.json` 中出现 `usage_source: "reported"`，出现该字段才说明服务端返回了真实用量。
 
 > 依赖安装：`D:\anaconda\python.exe -m pip install -r requirements.txt`
 
