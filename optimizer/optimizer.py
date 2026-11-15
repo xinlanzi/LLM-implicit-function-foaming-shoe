@@ -12,14 +12,15 @@
 
 关于“LLM”的说明
 ----------------
-默认 proposer_backend="mock"，即本地上下文感知模拟器；它不使用评价器，
-只根据 prompt 中的高分样本做变异/交叉。若配置真实 LLM API，则同一套流程可直接替换。
+默认 proposer_backend="siliconflow"，通过固定接口调用真实 LLM；
+proposer_backend="mock" 仅用于离线自检，它不使用评价器，也不访问网络。
 """
 
 from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -28,9 +29,109 @@ import numpy as np
 from config import Config
 from evaluator import EvalMetrics, Evaluator
 from population import Candidate, Population
-from proposer import Proposal, make_proposer, parse_llm_output
+from proposer import Proposal, make_proposer, parse_llm_output, scrub_secrets
 from seed_loader import PROFILE_DESCRIPTIONS, PROFILE_TAGS, SeedStructure, _profile_tag_union
 from token_library import TOKEN_BY_NAME, canonical_signature, get_allowed_tokens, token_roles
+
+
+def log_round(round_num: int, total: int, cfg: Config, elapsed: float,
+              parse_ok: bool, score: Optional[float], accepted: bool,
+              tok: Optional[Tuple[int, int, int]] = None,
+              cum: Optional[int] = None,
+              status: Optional[str] = None,
+              hint: str = "") -> None:
+    """每轮一行简洁进度（只对真实 LLM 打印；不含任何凭证）。"""
+    score_s = "-" if score is None else f"{score:.4f}"
+    state = status or ("ok" if parse_ok else "FAIL")
+    if hint and state != "ok":
+        state += f": {hint}"
+    line = (f"[r{round_num:02d}/{total}] {cfg.proposer_backend} | {cfg.llm_model} | "
+            f"{elapsed:5.2f}s | {state} | score={score_s} | "
+            f"accepted={'Y' if accepted else 'N'}")
+    if tok is not None:
+        line += f" | tok {tok[0]}/{tok[1]}/{tok[2]}"
+    if cum is not None:
+        line += f" | cum {cum:,}"
+    print(line)
+
+
+# --------------------------------------------------------------------------- #
+# 运行级 token 计量
+# --------------------------------------------------------------------------- #
+class UsageMeter:
+    """
+    token 累计器（进程内，只有数字，不含任何凭证）。
+
+    口径：
+      - prompt_tokens / completion_tokens / total_tokens 均为累计值；
+      - 每次成功响应记一次 requests；重试的失败调用也计入（挂在异常上的 usage）；
+      - usage_source：reported（服务端 usage）/ estimated（字符数估算）/ mixed / none。
+    """
+
+    def __init__(self):
+        self.requests = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self._sources = set()
+        self.per_round: List[dict] = []
+
+    def add(self, usage: Optional[dict], round_num: int, label: str, arm: str,
+            elapsed: float, parse_ok: bool, score: Optional[float],
+            accepted: bool) -> int:
+        if not usage:
+            return 0
+        p = int(usage.get("prompt_tokens") or 0)
+        c = int(usage.get("completion_tokens") or 0)
+        t = int(usage.get("total_tokens") or (p + c))
+        src = usage.get("usage_source") or "unknown"
+        self.requests += max(1, int(usage.get("requests") or 1))
+        self.prompt_tokens += p
+        self.completion_tokens += c
+        self.total_tokens += t
+        self._sources.add(src)
+        self.per_round.append({
+            "round": round_num, "arm": arm, "label": label,
+            "prompt_tokens": p, "completion_tokens": c, "total_tokens": t,
+            "cum_total_tokens": self.total_tokens,
+            "usage_source": src, "elapsed_s": round(float(elapsed), 3),
+            "parse_ok": bool(parse_ok),
+            "score": None if score is None else round(float(score), 4),
+            "accepted": bool(accepted),
+        })
+        return t
+
+    def to_dict(self) -> dict:
+        if not self.per_round:
+            src = "none"
+        elif len(self._sources) == 1:
+            src = next(iter(self._sources))
+        else:
+            src = "mixed"
+        return {
+            "requests": self.requests,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "usage_source": src,
+            "per_round": self.per_round,
+        }
+
+
+def stop_decision(cfg: Config, meter: UsageMeter, parse_ok: bool) -> Optional[str]:
+    """
+    停机判定（只在消耗 token 的 LLM 臂上调用）：
+
+      - `--max-total-tokens N`：累计 total_tokens >= N 时停（当前轮已完成后判定）；
+      - `--stop-after-first-response`：本轮成功解析出候选时停；
+      - 两者都满足时，**预算优先**（硬上限比冒烟开关更保守）。
+    """
+    limit = getattr(cfg, "max_total_tokens", None)
+    if limit is not None and meter.total_tokens >= int(limit):
+        return "max_total_tokens"
+    if getattr(cfg, "stop_after_first_response", False) and parse_ok:
+        return "stop_after_first_response"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +338,9 @@ def init_population(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Confi
 # 单臂运行（LLM 或随机基线）
 # --------------------------------------------------------------------------- #
 def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
-            profile: str, arm: str, seed_offset: int = 0) -> dict:
+            profile: str, arm: str, seed_offset: int = 0,
+            meter: Optional[UsageMeter] = None,
+            stop_state: Optional[dict] = None) -> dict:
     pop, seed_candidates = init_population(seeds, evaluator, cfg, profile)
     allowed = get_allowed_tokens(cfg.token_set)
     proposer = make_proposer(cfg, arm, seed_offset=seed_offset)
@@ -247,37 +350,143 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
     history: List[dict] = []
     all_candidates: List[Candidate] = list(seed_candidates)
     consecutive_reject = 0
+    show_progress = (arm == "llm" and cfg.proposer_backend != "mock")
+    meter = meter if meter is not None else UsageMeter()
+    stop_state = stop_state if stop_state is not None else {"triggered": False, "reason": None}
+    # 停机开关只作用于会消耗 token 的 LLM 臂；随机基线不花 token，跑完才有对照价值
+    stop_enabled = (arm == "llm")
+
+    def _finish(round_num: int, parse_ok: bool, score: Optional[float], accepted: bool,
+                usage: Optional[dict], elapsed: float,
+                stop_ok: Optional[bool] = None,
+                status: Optional[str] = None, hint: str = "") -> bool:
+        """
+        记录 token + 打印进度 + 判定停机；返回 True 表示应跳出本轮循环。
+
+        stop_ok：是否允许触发 `--stop-after-first-response`。
+        解析成功但候选被判重/非法时传 False（本轮没有可评价候选，不宜冒烟停机）；
+        预算判定不受该参数影响。
+        """
+        if usage:
+            meter.add(usage, round_num, profile, arm, elapsed, parse_ok, score, accepted)
+        if show_progress:
+            tok = None
+            if usage:
+                tok = (int(usage.get("prompt_tokens") or 0),
+                       int(usage.get("completion_tokens") or 0),
+                       int(usage.get("total_tokens") or 0))
+            log_round(round_num, cfg.rounds, cfg, elapsed, parse_ok, score, accepted,
+                      tok=tok, cum=(meter.total_tokens if usage else None),
+                      status=status, hint=hint)
+        can_stop_first = parse_ok if stop_ok is None else stop_ok
+        reason = stop_decision(cfg, meter, can_stop_first) if stop_enabled else None
+        if not reason:
+            return False
+        if reason == "max_total_tokens":
+            msg = (f"达到 token 预算 --max-total-tokens={int(cfg.max_total_tokens):,}"
+                   f"（累计 total_tokens={meter.total_tokens:,}）")
+        else:
+            msg = "--stop-after-first-response：已拿到首个成功解析的候选"
+        print(f"\n⏹ 提前停止：{msg}")
+        print(f"   已完成 {round_num}/{cfg.rounds} 轮，剩余 {max(0, cfg.rounds - round_num)} 轮；"
+              f"累计 tokens={meter.total_tokens:,}"
+              f"（prompt {meter.prompt_tokens:,} + completion {meter.completion_tokens:,}）")
+        stop_state.update({
+            "triggered": True, "reason": reason, "arm": arm, "profile": profile,
+            "round": round_num, "rounds_completed": round_num,
+            "rounds_remaining": max(0, cfg.rounds - round_num),
+            "total_tokens": meter.total_tokens, "message": msg,
+        })
+        history.append({
+            "round": round_num, "label": profile, "status": "early_stop",
+            "score": None, "accepted": False, "stop_reason": reason,
+            "reason": "提前停止：" + msg,
+        })
+        return True
 
     for round_num in range(1, cfg.rounds + 1):
         examples, random_example = select_examples(pop, profile, round_num, cfg, prompt_rng)
         prompt = build_prompt(profile, examples, random_example, round_num, cfg)
 
         # ---- 调用提议器 ----
+        t0 = time.perf_counter()
         try:
             proposal: Proposal = proposer.propose(prompt, examples, profile, round_num, seen)
             raw_text = proposal.text
             provenance = proposal.provenance
         except Exception as exc:
-            history.append({
-                "round": round_num, "label": profile, "status": "proposer_failed",
-                "score": None, "accepted": False, "reason": f"提议器失败：{exc}",
+            elapsed = time.perf_counter() - t0
+            # 失败的调用也可能烧了 token：从异常上取 usage
+            usage = getattr(exc, "usage", None)
+            status = getattr(exc, "status", None) or "proposer_failed"
+            http_status = getattr(exc, "http_status", None)
+            finish_reason = getattr(exc, "finish_reason", None)
+            raw_resp = scrub_secrets(str(getattr(exc, "raw", "") or "")[:300])
+            reasoning_head = getattr(exc, "reasoning_head", "") or ""
+            # 进度行只显示一句能定位问题的话，完整信息在 run_log.json
+            if status == "truncated":
+                hint = f"被 max_tokens={cfg.llm_max_tokens} 截断（finish_reason=length）"
+            elif status == "empty_content":
+                hint = "HTTP 200 但 content 为空"
+            elif status == "http_error":
+                hint = f"HTTP {http_status}" if http_status else "HTTP 错误"
+            elif status == "parse_failed":
+                hint = "输出不是合法 JSON"
+            elif status == "timeout":
+                phase = getattr(exc, "timeout_phase", None) or "-"
+                chunks = getattr(exc, "chunks", 0)
+                label = {"connect": "连接超时", "first_byte": "首字节超时",
+                         "idle": "块间空闲超时", "total": "总时长超时"}.get(phase, "超时")
+                hint = f"{label}（{phase}，已收 {chunks} chunk）"
+            elif status == "network_error":
+                hint = "网络/超时"
+            else:
+                hint = scrub_secrets(str(exc)).replace("\n", " ")[:80]
+            entry = {
+                "round": round_num, "label": profile, "status": status,
+                "score": None, "accepted": False,
+                "reason": f"提议器失败：{scrub_secrets(str(exc))}",
                 "terms": [], "coeffs": [],
-            })
+            }
+            if raw_resp:
+                entry["raw_response"] = raw_resp
+            if finish_reason:
+                entry["finish_reason"] = finish_reason
+            if http_status:
+                entry["http_status"] = http_status
+            if reasoning_head:
+                entry["reasoning_content_head"] = reasoning_head
+            if getattr(exc, "chunks", None) is not None:
+                entry["chunks"] = int(getattr(exc, "chunks", 0) or 0)
+            phase = getattr(exc, "timeout_phase", None)
+            if phase:
+                entry["timeout_phase"] = phase
+            partial = getattr(exc, "partial", None)
+            if partial:
+                entry["partial"] = partial
+            history.append(entry)
             all_candidates.append(Candidate(
                 label=profile, terms=[], coeffs=[], score=None, source=arm,
-                round=round_num, accepted=False, reason=f"提议器失败：{exc}",
-                signature="", status="proposer_failed",
+                round=round_num, accepted=False, reason=f"提议器失败：{scrub_secrets(str(exc))}",
+                signature="", status=status,
             ))
             consecutive_reject += 1
+            if _finish(round_num, False, None, False, usage, elapsed,
+                       status=status, hint=hint):
+                break
             continue
 
         # ---- 解析 ----
         try:
             obj = parse_llm_output(raw_text)
         except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            usage = (provenance or {}).get("usage")
             history.append({
                 "round": round_num, "label": profile, "status": "parse_failed",
                 "score": None, "accepted": False, "reason": f"JSON 解析失败：{exc}",
+                # 原始响应前 300 字符（已做 key 脱敏），便于排查模型输出格式问题
+                "raw_response": scrub_secrets(str(raw_text)[:300]),
                 "terms": [], "coeffs": [], "provenance": provenance,
             })
             all_candidates.append(Candidate(
@@ -286,11 +495,15 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
                 signature="", status="parse_failed", provenance=provenance,
             ))
             consecutive_reject += 1
+            if _finish(round_num, False, None, False, usage, elapsed,
+                       status="parse_failed", hint="输出不是合法 JSON"):
+                break
             continue
 
         # ---- 合法性检查 ----
         terms, coeffs, sig, reason = validate_candidate(obj, cfg, allowed, pop, seen)
         if terms is None:
+            elapsed = time.perf_counter() - t0
             status = "duplicate" if "去重" in reason else "invalid"
             history.append({
                 "round": round_num, "label": profile, "status": status,
@@ -307,6 +520,10 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
             if sig:
                 seen.add(sig)
             consecutive_reject += 1
+            if _finish(round_num, True, None, False,
+                       (provenance or {}).get("usage"), elapsed, stop_ok=False,
+                       status=status, hint=reason[:60]):
+                break
             continue
 
         # ---- 评价器 ----
@@ -360,6 +577,13 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
             "provenance": provenance,
         })
 
+        # 本轮的评价/入池/历史记录已完成，再判定停机（保证输出完整可读）
+        if _finish(round_num, True, hist_score, accepted,
+                   (provenance or {}).get("usage"), time.perf_counter() - t0,
+                   status=status,
+                   hint=(cand.reason[:60] if not accepted and cand.reason else "")):
+            break
+
         if cfg.convergence_patience and consecutive_reject >= cfg.convergence_patience:
             history.append({
                 "round": round_num, "label": profile, "status": "early_stop",
@@ -374,6 +598,7 @@ def run_arm(seeds: List[SeedStructure], evaluator: Evaluator, cfg: Config,
         "population": pop, "seed_candidates": seed_candidates,
         "history": history, "all_candidates": all_candidates,
         "summary": summary,
+        "stop": dict(stop_state),
     }
 
 
@@ -416,6 +641,10 @@ def summarize_arm(pop: Population, history: List[dict], seed_candidates: List[Ca
     for h in history:
         status_counts[h.get("status", "?")] = status_counts.get(h.get("status", "?"), 0) + 1
 
+    # 只有真正进了评价环节的轮次才参与入池率；全失败时返回 None（避免 mean of empty slice）
+    acc_flags = [1.0 if h.get("accepted") else 0.0 for h in history
+                 if h.get("status") in ("evaluated", "invalid_geometry")]
+
     return {
         "arm": arm,
         "profile": profile,
@@ -431,9 +660,7 @@ def summarize_arm(pop: Population, history: List[dict], seed_candidates: List[Ca
         "candidate_max": round(float(np.max(valid)), 6) if valid else None,
         "valid_count": len(valid),
         "accepted_count": int(sum(1 for h in history if h.get("accepted"))),
-        "acceptance_rate": round(float(np.mean([1.0 if h.get("accepted") else 0.0
-                                                for h in history if h.get("status") in
-                                                ("evaluated", "invalid_geometry")])), 4) if history else None,
+        "acceptance_rate": round(float(np.mean(acc_flags)), 4) if acc_flags else None,
         "status_counts": status_counts,
         "convergence_round": int(conv_round),
         "pool_summary": pop.summary(),

@@ -11,8 +11,8 @@
    它不是真实大模型，报告中必须明确标注为模拟器。
 
 2. OpenAICompatibleProposer
-   任意 OpenAI-compatible /chat/completions 服务（豆包、GPT、Claude 代理、本地 ollama 等）。
-   通过环境变量 LLM_API_KEY + Config.llm_base_url/llm_model 接入；temperature=0.7。
+   固定调用 SiliconFlow 的 OpenAI-compatible /chat/completions 接口。
+   密钥通过 tkinter 安全弹窗输入，只问一次并缓存在进程内存；**不写盘、不读环境变量**。
 
 3. RandomProposer
    技术文档要求的随机基线：从允许 token 中随机抽 1~3 个，系数 U[-2,2]。
@@ -22,13 +22,16 @@
 
 from __future__ import annotations
 
+import http.client
 import json
-import os
 import random
+import socket
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -37,6 +40,11 @@ from token_library import (
     canonical_signature,
     get_allowed_tokens,
 )
+
+# 固定真实 HTTP 接口；mock 是本地离线模拟器
+from config import LLM_PROVIDERS
+
+LLM_PROVIDER_NAMES = frozenset(k for k in LLM_PROVIDERS if k != "mock")
 
 
 # --------------------------------------------------------------------------- #
@@ -144,11 +152,19 @@ def parse_llm_output(text: str) -> dict:
     s = str(text).strip()
     if not s:
         raise ValueError("空输出")
-    # 去掉 markdown 代码围栏
+    # 去掉 markdown 代码围栏（```json ... ``` 或 ``` ... ```）
     if s.startswith("```"):
         s = s.strip("`")
         if s.lower().startswith("json"):
             s = s[4:]
+    # 少数服务会把整个 JSON 再包一层字符串："{\"terms\": ...}"，先解一层
+    if s.startswith('"') and s.endswith('"'):
+        try:
+            inner = json.loads(s)
+            if isinstance(inner, str):
+                s = inner.strip()
+        except Exception:
+            pass
     start = s.find("{")
     if start < 0:
         raise ValueError("输出中没有 JSON 对象")
@@ -177,7 +193,12 @@ def parse_llm_output(text: str) -> dict:
                 break
     if end < 0:
         raise ValueError("JSON 对象不完整")
-    obj = json.loads(s[start:end])
+    segment = s[start:end]
+    try:
+        obj = json.loads(segment)
+    except json.JSONDecodeError:
+        # 容错：模型偶尔把引号/换行二次转义成 \" 或 \\n 字面量
+        obj = json.loads(segment.replace('\\"', '"').replace("\\n", " "))
     if not isinstance(obj, dict):
         raise ValueError("JSON 顶层不是对象")
     if "terms" not in obj or "coeffs" not in obj:
@@ -427,66 +448,784 @@ class RandomProposer(BaseProposer):
 
 
 # --------------------------------------------------------------------------- #
-# 真实 LLM（OpenAI-compatible）
+# 凭证：安全弹窗 / 进程内缓存 / 打码
 # --------------------------------------------------------------------------- #
+class CredentialError(RuntimeError):
+    """无法创建弹窗，或用户取消、未输入密钥。"""
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.status = "credential_error"
+
+
+# 弹窗输入的 key 只问一次，只存在内存，不落盘。
+_KEY_CACHE: Dict[str, str] = {"value": ""}
+
+
+def mask_secret(value: str) -> str:
+    """凭证打码：只保留前 4 位与后 4 位，避免日志/终端泄露完整 key。"""
+    if not value:
+        return "(未设置)"
+    if len(value) <= 8:
+        return "****"
+    return f"{value[:4]}****{value[-4:]}"
+
+
+def scrub_secrets(text: str) -> str:
+    """把文本中可能出现的完整 key 替换为打码形式（用于异常信息与原始响应落盘）。"""
+    if not text:
+        return text
+    cand = _KEY_CACHE.get("value", "")
+    if cand and len(cand) >= 8 and cand in text:
+        text = text.replace(cand, mask_secret(cand))
+    return text
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    粗略估计 token 数（用于成本预估与上游不返回 usage 时的退化统计）。
+
+    口径：ASCII 按 4 字符/token，非 ASCII（中文等）按 1.6 字符/token。
+    这是经验值，英文/代码偏准、中文略保守；精确值以服务端 usage 为准。
+    """
+    if not text:
+        return 0
+    ascii_n = sum(1 for ch in text if ord(ch) < 128)
+    other_n = len(text) - ascii_n
+    return max(1, int(ascii_n / 4 + other_n / 1.6 + 0.5))
+
+
+def extract_usage(data: dict, prompt: str, content: str) -> dict:
+    """
+    从响应 JSON 读 usage；缺失时退化为字符数估算。
+
+    返回 {"prompt_tokens","completion_tokens","total_tokens","usage_source"}，
+    usage_source 为 "reported"（服务端返回）或 "estimated"（本地估算）。
+    """
+    u = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(u, dict) and isinstance(u.get("total_tokens"), (int, float)):
+        p = int(u.get("prompt_tokens") or 0)
+        c = int(u.get("completion_tokens") or 0)
+        return {"prompt_tokens": p, "completion_tokens": c,
+                "total_tokens": int(u.get("total_tokens") or (p + c)),
+                "usage_source": "reported"}
+    p = estimate_tokens(prompt)
+    c = estimate_tokens(content)
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c,
+            "usage_source": "estimated"}
+
+
+def _ask_key(label: str = "SiliconFlow API 密钥") -> str:
+    """用密码遮蔽弹窗读取密钥；取消、空输入或无法创建弹窗时安全中止。"""
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+    except ImportError as exc:
+        raise CredentialError("当前 Python 缺少 tkinter，无法创建密钥输入弹窗。") from exc
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        key = simpledialog.askstring(
+            "LLM 密钥输入",
+            f"请输入{label}：\n\n密钥仅以掩码显示，只保存在本进程内存，\n"
+            "不会写入文件、环境变量或日志。",
+            show="*",
+            parent=root,
+        )
+    except tk.TclError as exc:
+        raise CredentialError("无法创建密钥输入弹窗，请确认当前桌面环境可用。") from exc
+    finally:
+        if root is not None:
+            root.destroy()
+
+    key = (key or "").strip()
+    if not key:
+        raise CredentialError("未输入密钥或已取消弹窗，已中止。")
+    return key
+
+
+def resolve_api_key(cfg) -> Tuple[str, str]:
+    """从安全弹窗获取密钥并缓存于进程内存，返回 (key, 来源说明)。"""
+    cached = _KEY_CACHE.get("value", "")
+    if cached:
+        return cached, "内存缓存（本进程此前已通过弹窗输入）"
+
+    key = _ask_key()
+    _KEY_CACHE["value"] = key
+    return key, "安全弹窗输入（仅进程内缓存，后续轮次不再询问）"
+
+
+# --------------------------------------------------------------------------- #
+# 真实 LLM（固定 SiliconFlow，OpenAI-compatible）
+# --------------------------------------------------------------------------- #
+class LLMAuthError(RuntimeError):
+    """401/403：密钥错误或无权限，重试没有意义。"""
+
+
+class LLMFatalError(RuntimeError):
+    """400/404：请求体或端点/模型名错误，重试没有意义。"""
+
+
+class LLMRetryableError(RuntimeError):
+    """429 / 5xx / 超时 / 网络 / 解析失败：可指数退避重试。"""
+
+
+class LLMEmptyContentError(LLMRetryableError):
+    """
+    HTTP 200 但 choices[0].message.content 为空。
+
+    典型原因：
+      - 推理模型把输出额度全用在思维链上（finish_reason="length"），content 尚未开始；
+      - 服务端把答案放在 reasoning_content 而不是 content；
+      - 内容被安全策略清空。
+    带上 finish_reason / reasoning_content / 原始响应，便于上层给出可定位的 status。
+    """
+
+    def __init__(self, msg: str, finish_reason: Optional[str] = None,
+                 reasoning_content: str = "", raw: str = ""):
+        super().__init__(msg)
+        self.finish_reason = finish_reason
+        self.reasoning_content = reasoning_content
+        self.raw = raw
+        # 被 max_tokens 截断与"纯粹空响应"分开标注
+        self.status = "truncated" if finish_reason == "length" else "empty_content"
+
+
+def build_chat_payload(cfg, prompt: str, stream: Optional[bool] = None,
+                       max_tokens: Optional[int] = None,
+                       include_usage: bool = True) -> dict:
+    """
+    构造 /chat/completions 请求体（正式调用与 --debug-one-call 共用，保证一致）。
+
+    - stream：默认取 cfg.llm_stream（默认 True）。流式便于观测首字节/首 token/块间间隔；
+    - include_usage：流式时加 `stream_options={"include_usage": true}`，让最后一个
+      chunk 带上 usage；若上游不认该字段而返回 400，chat_once 会自动去掉它重发一次；
+    - enable_thinking：只有显式开启时才发送，避免部分模型/服务直接 400。
+    """
+    use_stream = bool(getattr(cfg, "llm_stream", True)) if stream is None else bool(stream)
+    mt = int(cfg.llm_max_tokens) if max_tokens is None else int(max_tokens)
+    payload = {
+        "model": cfg.llm_model,
+        "temperature": cfg.temperature,
+        "max_tokens": mt,
+        "stream": use_stream,
+        "messages": [
+            {"role": "system", "content": "你是严格的 JSON 输出器，只输出一个 JSON 对象。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    if use_stream and include_usage:
+        payload["stream_options"] = {"include_usage": True}
+    if cfg.proposer_backend == "siliconflow" and bool(cfg.llm_enable_thinking):
+        payload["enable_thinking"] = True
+    return payload
+
+
+def _http_target(base_url: str) -> Tuple[str, str, int, str]:
+    """把 base_url 拆成 (scheme, host, port, path)，支持 http:// 的本地假服务器。"""
+    u = urlsplit(base_url.rstrip("/") + "/chat/completions")
+    if not u.hostname:
+        raise ValueError(f"base_url 不合法：{base_url!r}")
+    scheme = (u.scheme or "https").lower()
+    port = u.port or (443 if scheme == "https" else 80)
+    path = u.path or "/chat/completions"
+    if u.query:
+        path += "?" + u.query
+    return scheme, u.hostname, port, path
+
+
+def _new_conn(scheme: str, host: str, port: int, timeout: float):
+    if scheme == "https":
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def _result_skeleton(stream: bool, max_tokens: int) -> dict:
+    """chat_once 的返回结构：所有字段固定存在，便于调试输出与上层映射。"""
+    return {
+        "ok": False, "stream": bool(stream), "max_tokens": int(max_tokens),
+        "http_status": None, "elapsed": 0.0,
+        "t_connect": None, "t_first_byte": None, "t_first_token": None,
+        "chunks": 0, "content": "", "reasoning": "",
+        "finish_reason": None, "usage": None, "usage_raw": None,
+        "usage_reported": False, "usage_unavailable": False,
+        "usage_unavailable_reason": None, "downgraded": False,
+        "error_kind": None, "timeout_phase": None, "error": "",
+        "raw": "", "body": "", "last_event": "", "message_keys": [],
+        "source": "", "key_mask": "", "payload": {},
+    }
+
+
+def _note_timeout(out: dict, phase: str, t0: float) -> None:
+    """把超时阶段、已等时长、已收 chunk 数与最后一段内容写进错误信息。"""
+    out["error_kind"] = "timeout"
+    out["timeout_phase"] = phase
+    out["elapsed"] = time.perf_counter() - t0
+    label = {"connect": "连接超时", "first_byte": "首字节超时",
+             "idle": "块间空闲超时", "total": "总时长超时"}.get(phase, "超时")
+    detail = [f"{label}：已等 {out['elapsed']:.2f}s", f"收到 {out['chunks']} 个 chunk"]
+    if out.get("t_connect") is not None:
+        detail.append(f"建连 {out['t_connect']:.2f}s")
+    if out.get("t_first_byte") is not None:
+        detail.append(f"首字节 {out['t_first_byte']:.2f}s")
+    if out.get("content"):
+        detail.append(f"最后 content 片段={out['content'][-60:]!r}")
+    if out.get("reasoning"):
+        detail.append(f"最后 reasoning 片段={out['reasoning'][-60:]!r}")
+    out["error"] = "；".join(detail)
+
+
+def _apply_usage(out: dict, prompt: str) -> None:
+    """reported（服务端 usage）优先；缺失时按字符数估算并标记 usage_unavailable。"""
+    u = out.get("usage_raw")
+    if isinstance(u, dict) and isinstance(u.get("total_tokens"), (int, float)):
+        p = int(u.get("prompt_tokens") or 0)
+        c = int(u.get("completion_tokens") or 0)
+        out["usage"] = {"prompt_tokens": p, "completion_tokens": c,
+                        "total_tokens": int(u.get("total_tokens") or (p + c)),
+                        "usage_source": "reported"}
+        out["usage_reported"] = True
+        return
+    # 流式没拿到 usage（或上游不支持 include_usage）：用 content+reasoning 估算
+    p = estimate_tokens(prompt)
+    c = estimate_tokens(out.get("content", "") + out.get("reasoning", ""))
+    out["usage"] = {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c,
+                    "usage_source": "estimated"}
+    if out.get("stream"):
+        out["usage_unavailable"] = True
+        out["usage_unavailable_reason"] = out.get("usage_unavailable_reason") or "no_usage_field"
+
+
+def _read_sse(out: dict, resp, conn, t0: float, deadline: float,
+              first_to: float, idle_to: float) -> None:
+    """逐行解析 SSE：`data: {...}` 累加 delta，跳过 `data: [DONE]`。"""
+    finish_reason = None
+    saw_done = False
+    raw_head: List[str] = []
+    while True:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            out["finish_reason"] = finish_reason
+            _note_timeout(out, "total", t0)
+            return
+        # 首个 chunk 之前用 first_token 超时，之后用块间空闲超时
+        wait = first_to if out["chunks"] == 0 else idle_to
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(max(0.5, min(wait, remain)))
+        except OSError:
+            pass
+        try:
+            line = resp.readline()
+        except socket.timeout:
+            out["finish_reason"] = finish_reason
+            _note_timeout(out, "first_byte" if out["chunks"] == 0 else "idle", t0)
+            return
+        except (http.client.HTTPException, OSError) as exc:
+            out["finish_reason"] = finish_reason
+            out["error_kind"] = "network_error"
+            out["elapsed"] = time.perf_counter() - t0
+            out["error"] = (f"流中途断连（{type(exc).__name__}: {exc}）："
+                            f"已收 {out['chunks']} 个 chunk，content {len(out['content'])} 字符")
+            return
+        if not line:
+            break       # 服务端关闭流
+        if out["t_first_byte"] is None:
+            out["t_first_byte"] = time.perf_counter() - t0
+        text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not text or text.startswith(":") or not text.startswith("data:"):
+            continue    # 空行 / SSE 注释 / event: 等非 data 行
+        if len(raw_head) < 200:
+            raw_head.append(text)
+        out["last_event"] = text[:400]
+        payload_s = text[5:].strip()
+        if payload_s == "[DONE]":
+            saw_done = True
+            break
+        try:
+            obj = json.loads(payload_s)
+        except Exception:
+            continue    # 单行 JSON 不完整（极少见）：跳过，不中断整条流
+        if not isinstance(obj, dict):
+            continue
+        u = obj.get("usage")
+        if isinstance(u, dict) and u:
+            out["usage_raw"] = u
+        choices = obj.get("choices") or []
+        if not choices:
+            continue    # include_usage 的收尾 chunk：只有 usage，没有 choices
+        choice = choices[0] or {}
+        # 兼容 delta（标准流式）与 message（少数服务直接给 message）
+        delta = choice.get("delta") or choice.get("message") or {}
+        piece = delta.get("content")
+        if isinstance(piece, list):
+            piece = "".join(p.get("text", "") for p in piece if isinstance(p, dict))
+        rpiece = delta.get("reasoning_content")
+        if rpiece is None:
+            rpiece = delta.get("reasoning")
+        if isinstance(rpiece, list):
+            rpiece = "".join(str(p) for p in rpiece)
+        out["chunks"] += 1
+        if piece:
+            out["content"] += str(piece)
+        if rpiece:
+            out["reasoning"] += str(rpiece)
+        if (piece or rpiece) and out["t_first_token"] is None:
+            out["t_first_token"] = time.perf_counter() - t0
+        fr = choice.get("finish_reason")
+        if fr:
+            finish_reason = fr
+    out["finish_reason"] = finish_reason
+    out["raw"] = scrub_secrets("\n".join(raw_head))[:4000]
+    if not saw_done and finish_reason is None:
+        # 服务端在既没有 [DONE] 也没有 finish_reason 的情况下断开 = 流被截断
+        out["error_kind"] = "network_error"
+        out["elapsed"] = time.perf_counter() - t0
+        out["error"] = (f"流意外结束（未收到 [DONE]/finish_reason）："
+                        f"已收 {out['chunks']} 个 chunk，content {len(out['content'])} 字符")
+
+
+def _chat_http(cfg, prompt: str, key: str, stream: bool, max_tokens: int,
+               include_usage: bool = True) -> dict:
+    """
+    发一次 HTTP 请求（流式或非流式），返回结构化 dict；**从不抛网络异常**，
+    所有失败都写进 error_kind/error，供 chat_once 决定是否降级、_call 决定映射成哪种异常。
+
+    分阶段超时（流式）：
+        connect  —— 建连（cfg.llm_connect_timeout，默认 10s）
+        first_byte —— 请求发出到第一个数据块（cfg.llm_first_token_timeout，默认 60s）
+        idle     —— 数据块之间的最大空闲（cfg.llm_idle_timeout，默认 30s）
+        total    —— 兜底总时长（cfg.llm_timeout，默认 180s）
+    非流式只有 connect + total 两段。
+    """
+    out = _result_skeleton(stream, max_tokens)
+    out["payload"] = build_chat_payload(cfg, prompt, stream=stream,
+                                        max_tokens=max_tokens,
+                                        include_usage=include_usage)
+    try:
+        scheme, host, port, path = _http_target(cfg.llm_base_url)
+    except ValueError as exc:
+        out["error_kind"] = "bad_response"
+        out["error"] = str(exc)
+        return out
+
+    body = json.dumps(out["payload"], ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
+        "Authorization": f"Bearer {key}",
+    }
+    connect_to = float(getattr(cfg, "llm_connect_timeout", 10.0))
+    first_to = float(getattr(cfg, "llm_first_token_timeout", 60.0))
+    idle_to = float(getattr(cfg, "llm_idle_timeout", 30.0))
+    total_to = float(cfg.llm_timeout)
+    deadline = time.monotonic() + total_to
+    t0 = time.perf_counter()
+
+    conn = _new_conn(scheme, host, port, connect_to)
+    try:
+        conn.connect()
+    except socket.timeout:
+        _note_timeout(out, "connect", t0)
+        return out
+    except (http.client.HTTPException, OSError) as exc:
+        out["error_kind"] = "network_error"
+        out["elapsed"] = time.perf_counter() - t0
+        out["error"] = f"连接失败（{type(exc).__name__}: {exc}）"
+        return out
+    out["t_connect"] = time.perf_counter() - t0
+
+    try:
+        if conn.sock is not None:
+            # 等响应头/首字节用首字节超时，而不是 connect+first 拼起来
+            conn.sock.settimeout(max(1.0, min(first_to, total_to)))
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+    except socket.timeout:
+        _note_timeout(out, "first_byte", t0)
+        return out
+    except (http.client.HTTPException, OSError) as exc:
+        out["error_kind"] = "network_error"
+        out["elapsed"] = time.perf_counter() - t0
+        out["error"] = f"发送/等待响应失败（{type(exc).__name__}: {exc}）"
+        return out
+
+    status = int(getattr(resp, "status", 0) or 0)
+    out["http_status"] = status
+    ctype = (resp.getheader("Content-Type") or "").lower()
+
+    if status != 200:
+        raw_err = ""
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(max(1.0, min(idle_to, deadline - time.monotonic())))
+            raw_err = resp.read(8000).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        out["raw"] = scrub_secrets(raw_err)[:4000]
+        out["body"] = scrub_secrets(raw_err)[:1200]
+        out["error_kind"] = "http_error"
+        out["elapsed"] = time.perf_counter() - t0
+        out["error"] = f"HTTP {status}"
+        return out
+
+    is_sse = bool(stream) and ("text/event-stream" in ctype or not ctype)
+
+    if not is_sse:
+        # --no-stream，或服务端无视 stream 直接返回整包 JSON
+        try:
+            if conn.sock is not None:
+                remain = max(1.0, deadline - time.monotonic())
+                conn.sock.settimeout(remain)
+            raw_bytes = resp.read()
+        except socket.timeout:
+            _note_timeout(out, "total", t0)
+            return out
+        except (http.client.HTTPException, OSError) as exc:
+            out["error_kind"] = "network_error"
+            out["elapsed"] = time.perf_counter() - t0
+            out["error"] = f"读响应失败（{type(exc).__name__}: {exc}）：已收 {len(out['content'])} 字符"
+            return out
+        out["t_first_byte"] = time.perf_counter() - t0
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        out["raw"] = scrub_secrets(raw_text)[:4000]
+        try:
+            data = json.loads(raw_text)
+        except Exception:
+            out["error_kind"] = "bad_response"
+            out["elapsed"] = time.perf_counter() - t0
+            out["error"] = f"HTTP {status} 响应不是 JSON：{scrub_secrets(raw_text[:300])}"
+            return out
+        try:
+            choice = (data.get("choices") or [])[0]
+            msg = choice.get("message") or {}
+        except Exception:
+            out["error_kind"] = "bad_response"
+            out["elapsed"] = time.perf_counter() - t0
+            out["error"] = (f"HTTP {status} 响应不是标准 chat/completions 结构："
+                            f"{scrub_secrets(raw_text[:300])}")
+            return out
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        out["content"] = "" if content is None else str(content)
+        out["reasoning"] = str(msg.get("reasoning_content") or "")
+        out["finish_reason"] = choice.get("finish_reason")
+        out["message_keys"] = list(msg.keys())
+        out["chunks"] = 1 if (out["content"] or out["reasoning"]) else 0
+        out["t_first_token"] = out["t_first_byte"] if out["chunks"] else None
+        u = data.get("usage")
+        if isinstance(u, dict) and u:
+            out["usage_raw"] = u
+        out["elapsed"] = time.perf_counter() - t0
+        _apply_usage(out, prompt)
+        out["ok"] = True
+        return out
+
+    _read_sse(out, resp, conn, t0, deadline, first_to, idle_to)
+    out["elapsed"] = time.perf_counter() - t0
+    _apply_usage(out, prompt)
+    if out["error_kind"]:
+        return out
+    if out["chunks"] == 0:
+        out["error_kind"] = "bad_response"
+        out["error"] = ("流式响应里没有任何 data 事件（不是标准 SSE；"
+                        f"Content-Type={ctype or '未给出'}）")
+        return out
+    out["ok"] = True
+    return out
+
+
+def chat_once(cfg, prompt: str, stream: Optional[bool] = None,
+              max_tokens: Optional[int] = None,
+              include_usage: bool = True) -> dict:
+    """
+    发一次真实请求并返回完整诊断结构（不做重试、不解析 JSON、不写盘）。
+
+    流式 + include_usage 时，若上游因不认识 `stream_options` 返回 400，
+    自动去掉该字段重发一次；成功后标记 usage_unavailable（用字符估算兜底）。
+    """
+    key, source = resolve_api_key(cfg)
+    if stream is None:
+        stream = bool(getattr(cfg, "llm_stream", True))
+    if max_tokens is None:
+        max_tokens = int(cfg.llm_max_tokens)
+    stream = bool(stream)
+    max_tokens = int(max_tokens)
+
+    out = _chat_http(cfg, prompt, key, stream, max_tokens, include_usage)
+    out["source"] = source
+    out["key_mask"] = mask_secret(key)
+
+    need_downgrade = (stream and include_usage and out.get("http_status") == 400
+                      and "stream_options" in (out.get("payload") or {}))
+    if not need_downgrade:
+        return out
+    first_err = out.get("error") or ""
+    out2 = _chat_http(cfg, prompt, key, stream, max_tokens, include_usage=False)
+    out2["downgraded"] = True
+    out2["first_error"] = first_err
+    out2["source"] = source
+    out2["key_mask"] = mask_secret(key)
+    if out2.get("http_status") == 200 and not out2.get("usage_reported"):
+        out2["usage_unavailable"] = True
+        out2["usage_unavailable_reason"] = "stream_options_removed"
+    return out2
+
+
 class OpenAICompatibleProposer(BaseProposer):
     """
-    通过标准 /chat/completions 接口接入真实 LLM。
+    通过标准 /chat/completions 接入真实 LLM。
 
-    运行前设置：
-        set LLM_API_KEY=...
-        set LLM_BASE_URL=https://api.openai.com/v1   （或豆包/ollama 的兼容地址）
-        set LLM_MODEL=gpt-4o-mini
-    并在 Config 中把 proposer_backend 设为 "openai"。
+    真实接口固定为 https://api.siliconflow.cn/v1/chat/completions。
+    SiliconFlow 特有的 enable_thinking 默认不发送，避免部分模型直接返回 400；
+    推理模型的思维链可能占满 max_tokens 并导致 content 为空。
     """
 
-    def _call(self, prompt: str) -> str:
-        key = os.environ.get(self.cfg.llm_api_key_env, "")
-        if not key:
-            raise RuntimeError(
-                f"未设置环境变量 {self.cfg.llm_api_key_env}，无法调用真实 LLM；"
-                f"请改用 proposer_backend='mock' 或配置 API 凭证。"
-            )
-        url = self.cfg.llm_base_url.rstrip("/") + "/chat/completions"
-        payload = {
-            "model": self.cfg.llm_model,
-            "temperature": self.cfg.temperature,
-            "messages": [
-                {"role": "system", "content": "你是严格的 JSON 输出器，只输出一个 JSON 对象。"},
-                {"role": "user", "content": prompt},
-            ],
+    def _payload(self, prompt: str) -> dict:
+        return build_chat_payload(self.cfg, prompt)
+
+    def _call(self, prompt: str) -> Tuple[str, dict, dict]:
+        """
+        发一次请求（默认流式），返回 (content, usage, meta)。
+
+        HTTP/网络/超时/空内容都映射成带 status 属性的异常，`status` 取值：
+          http_error / network_error / timeout / bad_response / empty_content
+        """
+        res = chat_once(self.cfg, prompt)
+        usage = res.get("usage") or {}
+        meta = {
+            "http_status": res.get("http_status"),
+            "finish_reason": res.get("finish_reason"),
+            "reasoning_content": res.get("reasoning", ""),
+            "message_keys": res.get("message_keys") or [],
+            "raw": res.get("raw", ""),
+            "chunks": res.get("chunks", 0),
+            "elapsed": res.get("elapsed", 0.0),
+            "t_first_byte": res.get("t_first_byte"),
+            "t_first_token": res.get("t_first_token"),
+            "max_tokens": res.get("max_tokens"),
+            "usage_unavailable": res.get("usage_unavailable", False),
+            "downgraded": res.get("downgraded", False),
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.cfg.llm_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+
+        kind = res.get("error_kind")
+        if kind:
+            msg = res.get("error") or kind
+            body = res.get("body") or ""
+            status = res.get("http_status")
+            if kind == "http_error":
+                if status in (401, 403):
+                    err = LLMAuthError(
+                        f"HTTP {status} 认证失败：密钥无效/过期/无权限。原始响应：{body}")
+                elif status in (400, 404):
+                    err = LLMFatalError(
+                        f"HTTP {status}：请求体参数/端点路径/模型名可能不对。原始响应：{body}")
+                elif status == 429:
+                    err = LLMRetryableError(f"HTTP 429 限流或余额不足：{body}")
+                else:
+                    err = LLMRetryableError(f"HTTP {status}：{body}")
+                err.status = "http_error"
+                err.http_status = status
+                err.raw = res.get("raw", "")
+            elif kind == "timeout":
+                err = LLMRetryableError(msg)
+                err.status = "timeout"
+                err.timeout_phase = res.get("timeout_phase")
+                err.http_status = status
+                err.raw = res.get("raw", "")
+            elif kind == "network_error":
+                err = LLMRetryableError(msg)
+                err.status = "network_error"
+                err.http_status = status
+                err.raw = res.get("raw", "")
+            else:       # bad_response
+                err = LLMRetryableError(msg)
+                err.status = "bad_response"
+                err.http_status = status
+                err.raw = res.get("raw", "")
+            err.chunks = res.get("chunks", 0)
+            err.partial = {
+                "chunks": res.get("chunks", 0),
+                "content": res.get("content", "")[:300],
+                "reasoning": res.get("reasoning", "")[:300],
+                "elapsed": round(float(res.get("elapsed") or 0.0), 2),
+                "timeout_phase": res.get("timeout_phase"),
+            }
+            err.usage = usage
+            raise err from None
+
+        text = res.get("content", "")
+        reasoning = res.get("reasoning", "")
+        finish_reason = res.get("finish_reason")
+        if not text.strip():
+            hint = (f"finish_reason={finish_reason!r}，max_tokens={res.get('max_tokens')}，"
+                    f"chunks={res.get('chunks')}，reasoning_content 有 {len(reasoning)} 字符")
+            raw_head = scrub_secrets(res.get("raw", ""))[:300]
+            err = LLMEmptyContentError(
+                f"HTTP {res.get('http_status')} 但 content 为空（{hint}）。原始响应前 300 字符："
+                f"{raw_head}",
+                finish_reason=finish_reason, reasoning_content=reasoning,
+                raw=scrub_secrets(res.get("raw", "")))
+            err.usage = usage
+            raise err
+        return text, usage, meta
 
     def propose(self, prompt: str, examples: List[dict], profile: str,
                 round_num: int, seen_signatures: Set[str]) -> Proposal:
-        last_err = None
-        for attempt in range(2):
+        retries = max(1, int(self.cfg.llm_max_retries))
+        last_err: Optional[Exception] = None
+        # 重试也会消耗 token：把每次尝试的 usage 累加，避免少记
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                       "usage_source": None, "requests": 0}
+        sources = set()
+
+        def _accumulate(usage: Optional[dict]) -> None:
+            if not usage:
+                return
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                usage_total[k] += int(usage.get(k, 0))
+            usage_total["requests"] += max(1, int(usage.get("requests") or 1))
+            sources.add(usage.get("usage_source", "estimated"))
+
+        for attempt in range(retries):
+            meta: dict = {}
             try:
-                text = self._call(prompt)
-                obj = parse_llm_output(text)
-                terms = [str(t) for t in obj["terms"]]
-                coeffs = [float(c) for c in obj["coeffs"]]
-                sig = canonical_signature(terms, coeffs)
-                if sig and sig not in seen_signatures:
-                    return Proposal(text=text, provenance={
-                        "operation": "llm_api", "model": self.cfg.llm_model,
-                        "round": round_num, "attempt": attempt + 1,
-                    })
-            except Exception as exc:  # 网络/解析异常都记录，继续重试
+                text, usage, meta = self._call(prompt)
+            except (LLMAuthError, LLMFatalError, LLMEmptyContentError, CredentialError) as exc:
+                # 认证/端点错误、以及"content 为空/被截断"都不重试：
+                # 同样的 prompt + max_tokens 再来一次只会再烧一遍 token。
+                _accumulate(getattr(exc, "usage", None))
+                raise
+            except Exception as exc:        # 429/5xx/超时/解析失败：指数退避重试
+                _accumulate(getattr(exc, "usage", None))
                 last_err = exc
-        raise RuntimeError(f"LLM 调用或解析失败：{last_err}")
+            else:
+                _accumulate(usage)
+                try:
+                    obj = parse_llm_output(text)
+                    terms = [str(t) for t in obj["terms"]]
+                    coeffs = [float(c) for c in obj["coeffs"]]
+                    sig = canonical_signature(terms, coeffs)
+                    if sig and sig not in seen_signatures:
+                        usage_total["usage_source"] = ("mixed" if len(sources) > 1
+                                                       else next(iter(sources)))
+                        return Proposal(text=text, provenance={
+                            "operation": "llm_api", "provider": self.cfg.proposer_backend,
+                            "model": self.cfg.llm_model, "round": round_num,
+                            "attempt": attempt + 1, "usage": usage_total,
+                        })
+                    dup = ValueError("候选与已见签名重复")
+                    dup.status = "duplicate"
+                    last_err = dup
+                except ValueError as exc:
+                    # finish_reason=length 时解析失败，直接标为"被 max_tokens 截断"
+                    exc.status = ("truncated" if meta.get("finish_reason") == "length"
+                                  else "parse_failed")
+                    exc.raw = text
+                    exc.finish_reason = meta.get("finish_reason")
+                    last_err = exc
+                    if exc.status == "truncated":
+                        break       # 同一 prompt 重试只会再被截断，白花钱
+            if attempt < retries - 1:
+                time.sleep(min(2.0 ** attempt, 8.0))
+
+        status = getattr(last_err, "status", None) or (
+            "http_error" if isinstance(last_err, LLMRetryableError) else "proposer_failed")
+        err = RuntimeError(
+            f"LLM 调用或解析失败（status={status}，已尝试 {retries} 次）："
+            f"{scrub_secrets(str(last_err))}")
+        err.status = status
+        err.raw = getattr(last_err, "raw", "") or ""
+        err.http_status = getattr(last_err, "http_status", None)
+        err.finish_reason = getattr(last_err, "finish_reason", None)
+        err.reasoning_head = (getattr(last_err, "reasoning_content", "") or "")[:300]
+        # 失败的调用也消耗了 token：把 usage 挂在异常上，由调用方计入运行级汇总
+        usage_total["usage_source"] = ("mixed" if len(sources) > 1
+                                       else (next(iter(sources)) if sources else "none"))
+        err.usage = usage_total
+        raise err
+
+
+def check_llm_endpoint(cfg) -> Tuple[str, str]:
+    """
+    轻量自检：弹窗读取密钥后发一次最小请求，验证凭证 / 固定端点 / 固定模型名。
+
+    返回 (状态码, 人类可读说明)，状态码用于进程退出码：
+        ok / no_key / auth / not_found / quota / timeout / network / server / bad_response
+    说明文本中只出现打码后的 key，绝不打印完整凭证。
+    """
+    base = (f"provider: {cfg.proposer_backend}\n"
+            f"端点   : {cfg.llm_base_url.rstrip('/')}/chat/completions\n"
+            f"模型   : {cfg.llm_model}\n")
+
+    try:
+        key, source = resolve_api_key(cfg)
+    except CredentialError as exc:
+        return "no_key", base + f"凭证   : (未获取)\n✗ {exc}"
+
+    head = base + (f"凭证   : {mask_secret(key)}（来源：{source}）\n"
+                   f"超时   : {cfg.llm_timeout}s\n")
+
+    payload = {
+        "model": cfg.llm_model,
+        "temperature": 0,
+        "max_tokens": 16,      # 只要一个极短响应；部分服务不接受 1
+        "stream": False,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    # 默认不发送 enable_thinking：部分模型不接受该字段，会让自检误报 400
+    if cfg.proposer_backend == "siliconflow" and bool(cfg.llm_enable_thinking):
+        payload["enable_thinking"] = True
+    req = urllib.request.Request(
+        cfg.llm_base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=min(cfg.llm_timeout, 30.0)) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+            ok = bool(data.get("choices"))
+        except Exception:
+            ok = False
+        if ok:
+            return "ok", head + "✓ 连通成功：凭证、端点、模型名均可用。"
+        return "bad_response", head + f"✗ 端点返回了非预期内容：{raw[:300]}"
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            pass
+        # SiliconFlow 的错误体：401 为纯字符串 "Invalid token"，429/503 为 JSON 对象
+        body = scrub_secrets(body)
+        if exc.code in (401, 403):
+            return "auth", head + (f"✗ HTTP {exc.code} 认证失败：密钥无效、已过期或无权限。\n"
+                                   f"  处理：到平台重新生成密钥，确认没有多余空格/引号。\n  {body}")
+        if exc.code == 404:
+            return "not_found", head + (f"✗ HTTP 404：端点路径或模型名不存在。\n"
+                                        f"  处理：检查 base_url 是否以 /v1 结尾、模型名拼写是否正确"
+                                        f"（SiliconFlow 形如 deepseek-ai/DeepSeek-V4-Flash）。\n  {body}")
+        if exc.code == 429:
+            return "quota", head + f"✗ HTTP 429 配额/频率限制：请充值或降低调用频率。\n  {body}"
+        if 500 <= exc.code < 600:
+            return "server", head + f"✗ HTTP {exc.code} 服务端错误：稍后重试或联系服务商。\n  {body}"
+        return "server", head + f"✗ HTTP {exc.code}：{body}"
+    except (TimeoutError, OSError) as exc:
+        # urllib 的超时在部分平台表现为 socket.timeout（OSError 子类）
+        name = type(exc).__name__
+        if "timeout" in name.lower() or "timed out" in str(exc).lower():
+            return "timeout", head + f"✗ 请求超时（{name}）：网络不通或服务端无响应。"
+        return "network", head + (f"✗ 网络不可达（{name}: {exc}）。\n"
+                                  f"  处理：检查代理/防火墙，或确认 base_url 主机名可达。")
+    except Exception as exc:  # 兜底，避免自检本身崩溃
+        return "server", head + f"✗ 未预期错误（{type(exc).__name__}）：{exc}"
 
 
 def make_proposer(config, arm: str, seed_offset: int = 0):
@@ -497,6 +1236,6 @@ def make_proposer(config, arm: str, seed_offset: int = 0):
     rng = np.random.default_rng(config.seed + seed_offset)
     if arm == "random":
         return RandomProposer(config, rng)
-    if config.proposer_backend == "openai":
+    if config.proposer_backend in LLM_PROVIDER_NAMES:
         return OpenAICompatibleProposer(config, rng)
     return MockLLMProposer(config, rng)

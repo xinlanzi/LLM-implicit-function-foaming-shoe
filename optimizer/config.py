@@ -9,7 +9,41 @@
 3. 参数集中在 Config 中，命令行只做少量覆盖，避免散落在业务代码里。
 """
 
+import os
 from dataclasses import dataclass, field
+from typing import Optional
+
+
+def _env_str(name: str, default: str) -> str:
+    """读取非密钥运行参数；未设置时使用代码默认值。"""
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------- #
+# 固定 LLM 接口；mock 仅用于离线自检，不访问网络
+# --------------------------------------------------------------------------- #
+# SiliconFlow 的 endpoint 与认证方式来自官方 API 文档：
+# https://api-docs.siliconflow.cn/docs/api/chat-completions-post
+LLM_PROVIDERS = {
+    "mock": {
+        "label": "本地模拟器（仅离线自检，无需凭证）",
+        "base_url": "",
+        "model": "",
+    },
+    "siliconflow": {
+        "label": "硅基流动 SiliconFlow",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "deepseek-ai/DeepSeek-V4-Flash",
+    },
+}
 
 
 @dataclass
@@ -74,14 +108,45 @@ class Config:
     curvature_k: float = 2.0
 
     # ------------------------------------------------------------------ 提议器
-    # "mock"   —— 本地上下文感知模拟器（无网络/凭证时默认）
-    # "openai" —— 任意 OpenAI-compatible Chat Completions 服务（豆包/GPT/Claude 代理/ollama）
-    proposer_backend: str = "mock"
-    temperature: float = 0.7         # 技术文档建议值
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
-    llm_api_key_env: str = "LLM_API_KEY"
-    llm_timeout: float = 60.0
+    # 默认使用固定的 SiliconFlow chat/completions 接口；base_url 与模型名不接受
+    # 命令行或环境变量覆盖。mock 只用于离线自检，不是真实大模型。
+    # 密钥只由 proposer.resolve_api_key 的安全弹窗读取，进程内缓存，不写入 Config。
+    proposer_backend: str = "siliconflow"
+    temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.7))
+    llm_base_url: str = LLM_PROVIDERS["siliconflow"]["base_url"]
+    llm_model: str = LLM_PROVIDERS["siliconflow"]["model"]
+    # ---------------- 流式与超时 ----------------
+    # 默认走 SSE 流式：能拿到首字节/首 token/块间间隔的实测数据，
+    # 且长 prompt + 推理模型不会因为“整包响应”在 60 秒处被一刀切。
+    llm_stream: bool = field(
+        default_factory=lambda: _env_str("LLM_STREAM", "1") not in ("0", "", "false", "False"))
+    # 分阶段超时（流式下任一阶段超时才算 timeout）：
+    #   connect   —— TCP/TLS 建连
+    #   first     —— 请求发出后等首字节（含等待服务端开始吐 token）
+    #   idle      —— 两个数据块之间的最大空闲
+    #   timeout   —— 兜底总时长（非流式的唯一超时）
+    llm_connect_timeout: float = field(
+        default_factory=lambda: _env_float("LLM_CONNECT_TIMEOUT", 10.0))
+    llm_first_token_timeout: float = field(
+        default_factory=lambda: _env_float("LLM_FIRST_TOKEN_TIMEOUT", 60.0))
+    llm_idle_timeout: float = field(
+        default_factory=lambda: _env_float("LLM_IDLE_TIMEOUT", 30.0))
+    llm_timeout: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT", 180.0))
+    llm_max_retries: int = 2         # 单轮生成最多尝试次数（429/5xx/超时指数退避重试）
+    # 候选 JSON 本身很短（约 30~60 token），但推理模型会先花大量 token 写思维链
+    # （reasoning_content），max_tokens 偏小会导致 content 为空 / finish_reason="length"。
+    # 默认 2048 给思维链留出额度；可用 --max-tokens 或 LLM_MAX_TOKENS 覆盖。
+    llm_max_tokens: int = field(default_factory=lambda: int(_env_float("LLM_MAX_TOKENS", 2048)))
+    # SiliconFlow 的 enable_thinking：默认不发送该字段（部分模型不接受，会直接 400）。
+    # 显式开启时才传 true。
+    llm_enable_thinking: bool = field(
+        default_factory=lambda: _env_str("LLM_ENABLE_THINKING", "0") not in ("0", "", "false", "False"))
+    # ------------------------------------------------------------------ token 预算与停机
+    # None = 不限制（避免意外截断长跑）
+    # 达到或超过该值后，**当前轮完成后**优雅停机，不中断正在进行的请求
+    max_total_tokens: Optional[int] = None
+    # 冒烟用：第一次成功解析出候选后停机（本轮的评价/入池/记录照常完成）
+    stop_after_first_response: bool = False
 
     # ------------------------------------------------------------------ 输出
     run_llm: bool = True
