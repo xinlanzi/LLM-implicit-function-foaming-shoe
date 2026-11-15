@@ -1,0 +1,14 @@
+# 大体积二进制统一走 Git LFS，避免再次出现几十 MB 的压缩包直接写入对象库。
+# 注意：已入库的历史对象不会因此改变（见审查报告 R-04）。
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.stl filter=lfs diff=lfs merge=lfs -text
+
+# 便于 git 与各平台正确识别二进制/文本
+*.png binary
+*.xlsx binary
+*.step text eol=lf
+*.js text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.csv text eol=lf
+*.json text eol=lf

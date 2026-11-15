@@ -1,0 +1,8 @@
+# 组合优化器运行依赖（Python >= 3.9）
+# 已在 Python 3.9.13 验证；tkinter 为标准库，Linux 需另装 python3-tk
+numpy>=1.24
+scipy>=1.9
+scikit-image>=0.19
+pandas>=1.5
+matplotlib>=3.5
+openpyxl>=3.0
